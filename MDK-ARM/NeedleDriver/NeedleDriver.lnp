@@ -1,0 +1,24 @@
+--cpu Cortex-M3
+"needledriver\startup_stm32f103xe.o"
+"needledriver\main.o"
+"needledriver\stm32f1xx_it.o"
+"needledriver\stm32f1xx_hal_msp.o"
+"needledriver\stm32f1xx_hal_gpio_ex.o"
+"needledriver\stm32f1xx_hal_tim.o"
+"needledriver\stm32f1xx_hal_tim_ex.o"
+"needledriver\stm32f1xx_hal.o"
+"needledriver\stm32f1xx_hal_rcc.o"
+"needledriver\stm32f1xx_hal_rcc_ex.o"
+"needledriver\stm32f1xx_hal_gpio.o"
+"needledriver\stm32f1xx_hal_dma.o"
+"needledriver\stm32f1xx_hal_cortex.o"
+"needledriver\stm32f1xx_hal_pwr.o"
+"needledriver\stm32f1xx_hal_flash.o"
+"needledriver\stm32f1xx_hal_flash_ex.o"
+"needledriver\stm32f1xx_hal_exti.o"
+"needledriver\stm32f1xx_hal_uart.o"
+"needledriver\system_stm32f1xx.o"
+--strict --scatter "NeedleDriver\NeedleDriver.sct"
+--summary_stderr --info summarysizes --map --xref --callgraph --symbols
+--info sizes --info totals --info unused --info veneers
+--list "NeedleDriver.map" -o NeedleDriver\NeedleDriver.axf
