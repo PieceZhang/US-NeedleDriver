@@ -46,6 +46,122 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 
+#define SYSTICK_LOAD (SystemCoreClock/1000000U)
+#define SYSTICK_DELAY_CALIB (SYSTICK_LOAD >> 1)
+#define DELAY_US(us) \
+    do { \
+         uint32_t start = SysTick->VAL; \
+         uint32_t ticks = (us * SYSTICK_LOAD)-SYSTICK_DELAY_CALIB;  \
+         while((start - SysTick->VAL) < ticks); \
+    } while (0)
+
+/* UART RX handling */
+#define RXBUFFERSIZE  64
+char RxBuffer[RXBUFFERSIZE];
+uint8_t aRxBuffer;
+uint8_t Uart1_Rx_Cnt = 0;
+uint8_t cmd[3];
+uint8_t query_flag = 0;
+
+/* Command preemption: set to 1 by RX ISR when a normal command arrives */
+volatile uint8_t new_cmd_ready = 0;
+
+uint8_t state = 1;
+uint8_t flag = 0;       /* 1 while executing a command */
+uint32_t current_mm = 0; /* position in 0.01 mm units (1mm = 100) */
+
+/* Accumulate pulses not equal to a full 0.01mm (32 pulses = 1 unit) */
+static volatile int32_t pulse_accum = 0;
+
+#define TXBUFFERSIZE  7
+char TxBuffer[TXBUFFERSIZE] = {0xff, 0x0, 0x0, 0x0, 0x0, 0x0d, 0x0a};
+
+#define WARNING_LED()        HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET)
+#define STATUS_LED()         HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin)
+
+#define CLOCKWISE            0
+#define ANTI_CLOCKWISE       1
+
+#define MOTOR_EN_ON()        HAL_GPIO_WritePin(EN_GPIO_Port, EN_Pin, GPIO_PIN_SET)  /* motor shut down (driver EN high) */
+#define MOTOR_EN_OFF()       HAL_GPIO_WritePin(EN_GPIO_Port, EN_Pin, GPIO_PIN_RESET)
+#define MOTOR_PUL_ON()       HAL_GPIO_WritePin(PUL_GPIO_Port, PUL_Pin, GPIO_PIN_SET)
+#define MOTOR_PUL_OFF()      HAL_GPIO_WritePin(PUL_GPIO_Port, PUL_Pin, GPIO_PIN_RESET)
+#define MOTOR_DIR_ON()       HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, GPIO_PIN_SET)
+#define MOTOR_DIR_OFF()      HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, GPIO_PIN_RESET)
+
+/* stepper_turn return codes */
+#define TURN_DONE            1u
+#define TURN_ABORTED         2u
+#define TURN_LIMIT_REACHED   3u
+
+/* Perform angle turn at timing 'tim' us per pulse edge; supports preemption.
+   Updates current_mm in 0.01 mm units based on actual pulses emitted.
+   Returns:
+     TURN_DONE          - requested angle completed
+     TURN_ABORTED       - aborted due to new_cmd_ready
+     TURN_LIMIT_REACHED - limit/home switch condition met (state=0) */
+uint8_t stepper_turn(int tim, float angle, uint8_t dir)
+{
+    float subdivide = 32.0f; /* usteps per 1.8° */
+    int n = (int)(angle / (1.8f / subdivide)); /* pulses to emit for requested angle */
+
+    if (dir == CLOCKWISE)
+        MOTOR_DIR_ON();
+    else /* ANTI_CLOCKWISE */
+        MOTOR_DIR_OFF();
+
+    int pulses_sent = 0;
+    uint8_t ret = TURN_DONE;
+
+    for (int i = 0; i < n; i++)
+    {
+        /* Preempt as soon as a new command is ready */
+        if (new_cmd_ready) { ret = TURN_ABORTED; break; }
+
+        /* Limit switch handling (home at CLOCKWISE direction) */
+        if (HAL_GPIO_ReadPin(KEY3_GPIO_Port, KEY3_Pin) == GPIO_PIN_SET && dir == CLOCKWISE)
+        {
+            MOTOR_EN_ON();  /* disable motor driver */
+            state = 0;      /* at home/end */
+            ret = TURN_LIMIT_REACHED;
+            break;
+        }
+        else if (HAL_GPIO_ReadPin(KEY3_GPIO_Port, KEY3_Pin) == GPIO_PIN_RESET || dir == ANTI_CLOCKWISE)
+        {
+            MOTOR_EN_OFF();
+            state = 1;
+        }
+
+        /* One step pulse */
+        MOTOR_PUL_OFF();
+        DELAY_US(tim/2);
+        MOTOR_PUL_ON();
+        DELAY_US(tim/2);
+        HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+
+        pulses_sent++;
+    }
+
+    /* Update position based on emitted pulses (32 pulses = 0.01 mm = 1 unit) */
+    if (state == 0)  /* reached home */
+    {
+        current_mm = 0;
+        pulse_accum = 0;
+    }
+    else
+    {
+        if (dir == ANTI_CLOCKWISE)
+            pulse_accum += pulses_sent;
+        else
+            pulse_accum -= pulses_sent;
+
+        while (pulse_accum >= 32) { current_mm += 1; pulse_accum -= 32; }
+        while (pulse_accum <= -32) { current_mm -= 1; pulse_accum += 32; }
+    }
+
+    return ret;
+}
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -61,83 +177,8 @@ static void MX_TIM2_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-#define SYSTICK_LOAD (SystemCoreClock/1000000U)
-#define SYSTICK_DELAY_CALIB (SYSTICK_LOAD >> 1)
-#define DELAY_US(us) \
-    do { \
-         uint32_t start = SysTick->VAL; \
-         uint32_t ticks = (us * SYSTICK_LOAD)-SYSTICK_DELAY_CALIB;  \
-         while((start - SysTick->VAL) < ticks); \
-    } while (0)
-		
 
-#define RXBUFFERSIZE  64     //???????
-char RxBuffer[RXBUFFERSIZE];   //????
-uint8_t aRxBuffer;			//??????
-uint8_t Uart1_Rx_Cnt = 0;		//??????
-uint8_t cmd[3];
-uint8_t query_flag = 0;
-		
-uint8_t state = 1;
-uint8_t flag = 0;
-uint32_t current_mm = 0;
-#define TXBUFFERSIZE  7
-char TxBuffer[TXBUFFERSIZE] = {0xff, 0x0, 0x0, 0x0, 0x0, 0x0d, 0x0a};
-	
-#define WARNING_LED() 		HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET)
-#define	STATUS_LED()			HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin)
 
-#define CLOCKWISE					0
-#define ANTI_CLOCKWISE		1
-
-#define MOTOR_EN_ON()			HAL_GPIO_WritePin(EN_GPIO_Port, EN_Pin, GPIO_PIN_SET)  // motor shut down
-#define MOTOR_EN_OFF()		HAL_GPIO_WritePin(EN_GPIO_Port, EN_Pin, GPIO_PIN_RESET)
-#define MOTOR_PUL_ON()    HAL_GPIO_WritePin(PUL_GPIO_Port, PUL_Pin, GPIO_PIN_SET)
-#define MOTOR_PUL_OFF()   HAL_GPIO_WritePin(PUL_GPIO_Port, PUL_Pin, GPIO_PIN_RESET)
-#define MOTOR_DIR_ON()    HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, GPIO_PIN_SET)
-#define MOTOR_DIR_OFF()   HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, GPIO_PIN_RESET)
-
-uint8_t stepper_turn(int tim, float angle, uint8_t dir)
-{
-	float subdivide = 32;
-  int n,i;
-  n=(int)(angle/(1.8/subdivide));
-	
-  if(dir==CLOCKWISE)        
-  {
-    MOTOR_DIR_ON();
-  }
-  else if(dir==ANTI_CLOCKWISE)
-  {
-    MOTOR_DIR_OFF();
-  }
-   
-  for(i=0;i<n;i++)
-  {
-    MOTOR_PUL_OFF();
-    DELAY_US(tim/2);
-		MOTOR_PUL_ON();
-    DELAY_US(tim/2);
-		HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
-		
-		if(HAL_GPIO_ReadPin(KEY3_GPIO_Port, KEY3_Pin) == GPIO_PIN_SET && dir == CLOCKWISE) 
-			{MOTOR_EN_ON(); state = 0;}
-		else if(HAL_GPIO_ReadPin(KEY3_GPIO_Port, KEY3_Pin) == GPIO_PIN_RESET || dir == ANTI_CLOCKWISE) 
-			{MOTOR_EN_OFF(); state = 1;}
-  }
-		
-	if(state == 0)  // reach the end
-		current_mm = 0;
-	else
-	{
-		if(dir == ANTI_CLOCKWISE)
-			current_mm += 50;  // + 0.5 mm
-		else
-			current_mm -= 50;  // - 0.5 mm
-	}
-				
-	return 1;
-}
 
 /* USER CODE END 0 */
 
@@ -172,59 +213,101 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-	HAL_UART_Receive_IT(&huart1, (uint8_t *)&aRxBuffer, 1);
+  HAL_UART_Receive_IT(&huart1, (uint8_t *)&aRxBuffer, 1);
   HAL_TIM_Base_Start_IT(&htim2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-	MOTOR_EN_OFF();
-//	for(int i=0; i<4*50; i++)  // 360deg -> 2mm
-//	{
-//		stepper_turn(60, 90, CLOCKWISE);
-//	}
-	uint8_t direction, circ, vel;
-	int time_per_step;
-	
-	// reset needle position
-	while (state)
-	{
-		stepper_turn(20, 30, CLOCKWISE);
-		current_mm = 0;
-	}
-	
-	while (1)
+  MOTOR_EN_OFF();
+
+  uint8_t direction = CLOCKWISE;
+  uint8_t circ = 0, vel = 0;
+  int time_per_step = 0;
+  int32_t steps_remaining = 0; /* number of 0.5 mm (90°) chunks to execute */
+
+  /* Reset needle position (home), but allow preemption by new command */
+  while (state)
   {
-		HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
-		
-		while(HAL_GPIO_ReadPin(KEY1_GPIO_Port, KEY1_Pin) == GPIO_PIN_RESET)
-		{
-			stepper_turn(45, 90, ANTI_CLOCKWISE);
-		}
-		while(HAL_GPIO_ReadPin(KEY2_GPIO_Port, KEY2_Pin) == GPIO_PIN_RESET)
-		{
-			stepper_turn(45, 90, CLOCKWISE);
-		}
-		
-		if(cmd[1] != 0 && cmd[2] != 0)
-		{
-			flag = 1;
-			// cmd [FNB, length, velocity]
-			if(cmd[0] == 1)
-				direction = ANTI_CLOCKWISE;
-			else if (cmd[0] == 0)
-				direction = CLOCKWISE;
-			
-			circ = cmd[1] / 2;  // 360deg -> 2mm
-			vel = cmd[2];  // mm/s
-			time_per_step = 0.5 / vel * 1000;  // ms
-			for(int i=0; i<4*circ; i++)
-			{
-				stepper_turn(time_per_step, 90, direction);  // 0.5mm per step
-			}
-			flag = 0;
-			memset(cmd, 0, 3);
-		}
+      if (new_cmd_ready) break; /* preempt homing if command arrives */
+      (void)stepper_turn(20, 30, CLOCKWISE);
+      current_mm = 0;
+  }
+
+  while (1)
+  {
+    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+
+    /* If a new command arrived, accept it and preempt any current command */
+    if (new_cmd_ready)
+    {
+        /* cmd[0]=dir, cmd[1]=length, cmd[2]=velocity */
+        if (cmd[1] != 0 && cmd[2] != 0)
+        {
+            flag = 1; /* busy */
+            direction = (cmd[0] == 1) ? ANTI_CLOCKWISE : CLOCKWISE;
+
+            circ = cmd[1] / 2;       /* 360deg -> 2mm (keep original mapping) */
+            vel = cmd[2];            /* mm/s */
+            time_per_step = (int)(0.5f / vel * 1000.0f);  /* original formula kept */
+
+            steps_remaining = 4 * circ; /* number of 0.5mm (90°) segments */
+
+            /* Start immediately; clear the ready flag so we know we've taken it */
+            new_cmd_ready = 0;
+        }
+        else
+        {
+            /* Invalid command (length/vel zero): ignore */
+            new_cmd_ready = 0;
+        }
+    }
+
+    if (flag && steps_remaining > 0)
+    {
+        /* Execute one 0.5mm chunk (90°). This call is preemptible. */
+        uint8_t r = stepper_turn(time_per_step, 90, direction);
+
+        if (r == TURN_DONE)
+        {
+            steps_remaining--;
+            if (steps_remaining <= 0)
+            {
+                flag = 0;
+                memset(cmd, 0, 3);
+            }
+        }
+        else if (r == TURN_ABORTED)
+        {
+            /* New command arrived: stop current, main loop will pick it up next iteration */
+            flag = 0;
+            /* Do not clear cmd/new_cmd_ready here; they hold the new command */
+        }
+        else if (r == TURN_LIMIT_REACHED)
+        {
+            /* Hit home/limit; stop current command */
+            flag = 0;
+            steps_remaining = 0;
+            memset(cmd, 0, 3);
+        }
+
+        /* After handling one chunk (or abort), continue loop */
+        continue;
+    }
+
+    /* No active command: allow manual jogging, but still preemptible */
+    while (HAL_GPIO_ReadPin(KEY1_GPIO_Port, KEY1_Pin) == GPIO_PIN_RESET)
+    {
+        if (new_cmd_ready) break; /* preempt manual move */
+        uint8_t r = stepper_turn(45, 90, ANTI_CLOCKWISE);
+        if (r != TURN_DONE) break; /* limit or abort */
+    }
+    while (HAL_GPIO_ReadPin(KEY2_GPIO_Port, KEY2_Pin) == GPIO_PIN_RESET)
+    {
+        if (new_cmd_ready) break; /* preempt manual move */
+        uint8_t r = stepper_turn(45, 90, CLOCKWISE);
+        if (r != TURN_DONE) break; /* limit or abort */
+    }
 
     /* USER CODE END WHILE */
 
@@ -407,51 +490,54 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   /* NOTE: This function Should not be modified, when the callback is needed,
            the HAL_UART_TxCpltCallback could be implemented in the user file
    */
-	
-	if(Uart1_Rx_Cnt >= 255)
-	{
-		Uart1_Rx_Cnt = 0;
-		memset(RxBuffer,0x00,sizeof(RxBuffer));        
-	}
-	
-	else
-	{
-		RxBuffer[Uart1_Rx_Cnt++] = aRxBuffer;   // save
-	
-		if((RxBuffer[Uart1_Rx_Cnt-1] == 0x0A)&&(RxBuffer[Uart1_Rx_Cnt-2] == 0x0D))  // detect the end sign 0x0D0A
-		{
-//			HAL_UART_Transmit(&huart1, (uint8_t *)&RxBuffer, Uart1_Rx_Cnt,0xFFFF);  // transmit for debug
-//            while(HAL_UART_GetState(&huart1) == HAL_UART_STATE_BUSY_TX);
-			if (RxBuffer[1] == (char)0xaa && RxBuffer[3] == (char)0xaa && RxBuffer[4] == (char)0xaa && RxBuffer[6] == (char)0xaa && RxBuffer[7] == (char)0xaa)
-				query_flag = 1;
-			else
-			{
-				cmd[0] = RxBuffer[1];
-				cmd[1] = RxBuffer[3]*10 + RxBuffer[4];
-				cmd[2] = RxBuffer[6]*10 + RxBuffer[7];
-			}
-			Uart1_Rx_Cnt = 0;
-			memset(RxBuffer,0x00,sizeof(RxBuffer));
-		}
-	}
-	
-	HAL_UART_Receive_IT(&huart1, (uint8_t *)&aRxBuffer, 1);
+
+  if(Uart1_Rx_Cnt >= 255)
+  {
+    Uart1_Rx_Cnt = 0;
+    memset(RxBuffer,0x00,sizeof(RxBuffer));
+  }
+  else
+  {
+    RxBuffer[Uart1_Rx_Cnt++] = aRxBuffer;   /* save */
+
+    if((RxBuffer[Uart1_Rx_Cnt-1] == 0x0A)&&(RxBuffer[Uart1_Rx_Cnt-2] == 0x0D))  /* detect the end sign 0x0D0A */
+    {
+      /*HAL_UART_Transmit(&huart1, (uint8_t *)&RxBuffer, Uart1_Rx_Cnt,0xFFFF);*/
+
+      if (RxBuffer[1] == (char)0xaa && RxBuffer[3] == (char)0xaa && RxBuffer[4] == (char)0xaa && RxBuffer[6] == (char)0xaa && RxBuffer[7] == (char)0xaa)
+      {
+        query_flag = 1;
+      }
+      else
+      {
+        /* Normal command: parse and mark as ready (this will preempt motion) */
+        cmd[0] = RxBuffer[1];
+        cmd[1] = (uint8_t)(RxBuffer[3]*10 + RxBuffer[4]);
+        cmd[2] = (uint8_t)(RxBuffer[6]*10 + RxBuffer[7]);
+        new_cmd_ready = 1; /* signal preemption */
+      }
+      Uart1_Rx_Cnt = 0;
+      memset(RxBuffer,0x00,sizeof(RxBuffer));
+    }
+  }
+
+  HAL_UART_Receive_IT(&huart1, (uint8_t *)&aRxBuffer, 1);
 }
 
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim == (&htim2))  // 5 ms 200 hz
+    if (htim == (&htim2))  /* 5 ms 200 hz */
     {
-			if(query_flag)
-			{
-				TxBuffer[1] = state;
-				TxBuffer[2] = flag;
-				TxBuffer[3] = (uint8_t) (current_mm / 100);
-				TxBuffer[4] = (uint8_t) (current_mm % 100);
-				HAL_UART_Transmit(&huart1, (uint8_t *)&TxBuffer, TXBUFFERSIZE, 0xFF); 
-				query_flag = 0;
-			}
+      if(query_flag)
+      {
+        TxBuffer[1] = state;
+        TxBuffer[2] = flag;
+        TxBuffer[3] = (uint8_t) (current_mm / 100);
+        TxBuffer[4] = (uint8_t) (current_mm % 100);
+        HAL_UART_Transmit(&huart1, (uint8_t *)&TxBuffer, TXBUFFERSIZE, 0xFF);
+        query_flag = 0;
+      }
     }
 }
 
